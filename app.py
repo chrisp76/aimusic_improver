@@ -149,9 +149,11 @@ def _has_demucs() -> bool:
     return importlib.util.find_spec("demucs") is not None
 
 
-def separate_stems_demucs(input_path: str, model: str = "htdemucs") -> Tuple[str, str]:
+def separate_stems_demucs(input_path: str, model: str = "htdemucs", device: str = "cpu") -> Tuple[str | None, str]:
     if not _has_demucs():
-        return "", "Demucs nicht installiert. Optional mit: pip install demucs torch torchaudio"
+        return None, "Demucs nicht installiert. Optional mit: pip install demucs torch torchaudio"
+    if not input_path or not os.path.isfile(input_path):
+        return None, f"Ungültiger Datei-Pfad: {input_path}"
     out_root = tempfile.mkdtemp(prefix="demucs_out_")
     try:
         cmd = [
@@ -162,11 +164,34 @@ def separate_stems_demucs(input_path: str, model: str = "htdemucs") -> Tuple[str
             model,
             "-o",
             out_root,
-            input_path,
+            "--jobs",
+            "1",
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if device and device.lower() != "auto":
+            cmd += ["-d", device.lower()]
+        cmd += [input_path]
+
+        env = os.environ.copy()
+        # ensure writable local caches for model downloads
+        cache_root = os.path.join(os.path.dirname(__file__), ".cache")
+        os.makedirs(cache_root, exist_ok=True)
+        env.setdefault("XDG_CACHE_HOME", cache_root)
+        env.setdefault("TORCH_HOME", os.path.join(cache_root, "torch"))
+        env.setdefault("DEMUCS_HOME", os.path.join(cache_root, "demucs"))
+        env.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
+        proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
         if proc.returncode != 0:
-            return "", f"Demucs Fehler: {proc.stderr or proc.stdout}"
+            err = (proc.stderr or proc.stdout or "").strip()
+            # Kürzen langer Ausgaben
+            if len(err) > 2000:
+                err = err[:2000] + "..."
+            shown_cmd = " ".join(cmd[:8]) + " ..." if len(" ".join(cmd)) > 120 else " ".join(cmd)
+            return None, (
+                f"Demucs Fehler (Code {proc.returncode}) auf Gerät '{device}':\n"
+                f"{err}\nCommand: {shown_cmd}\n"
+                "Hinweis: Stelle Internetzugang sicher (Modell-Download), und versuche Gerät 'cpu'."
+            )
 
         stems_dir = None
         for root, dirs, files in os.walk(out_root):
@@ -174,7 +199,7 @@ def separate_stems_demucs(input_path: str, model: str = "htdemucs") -> Tuple[str
             if wavs:
                 stems_dir = root
         if stems_dir is None:
-            return "", "Keine Stems gefunden."
+            return None, "Keine Stems gefunden."
 
         zip_tmp = tempfile.NamedTemporaryFile(suffix="_stems.zip", delete=False)
         with zipfile.ZipFile(zip_tmp.name, "w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -183,13 +208,57 @@ def separate_stems_demucs(input_path: str, model: str = "htdemucs") -> Tuple[str
                     zf.write(os.path.join(stems_dir, f), arcname=f)
         return zip_tmp.name, "Stems ZIP erstellt"
     except Exception as e:
-        return "", f"Demucs Ausnahme: {e}"
+        return None, f"Demucs Ausnahme: {e}"
 
 
-def ui_split_stems(file):
+def _simple_splitter_zip(input_path: str) -> Tuple[str | None, str]:
+    try:
+        y, sr = librosa.load(input_path, sr=48000, mono=False)
+        y = _ensure_2d(y)
+        if y.shape[0] == 1:
+            # Fake stereo for processing
+            y = np.vstack([y[0], y[0]])
+
+        left, right = y[0], y[1]
+        mid = 0.5 * (left + right)
+        side = 0.5 * (left - right)
+
+        # Band-limit the mid to human voice-ish region
+        vocal_band = bandpass(mid, 48000, 120.0, 9000.0)
+        vocalish = simple_compressor(vocal_band, 48000, threshold_db=-26.0, ratio=2.5)
+        vocalish = soft_limiter(vocalish, ceiling_db=-0.5)
+
+        # Recreate 2ch vocalish as centered
+        vocal_stereo = np.vstack([vocalish, vocalish])
+
+        # Instrumentalish = original - vocalish contribution
+        instrumental = y - vocal_stereo
+        instrumental = soft_limiter(instrumental, ceiling_db=-0.5)
+
+        with tempfile.TemporaryDirectory() as td:
+            v_path = os.path.join(td, "vocals_simple.wav")
+            i_path = os.path.join(td, "instrumental_simple.wav")
+            sf.write(v_path, vocal_stereo.T, 48000, subtype="PCM_16")
+            sf.write(i_path, instrumental.T, 48000, subtype="PCM_16")
+
+            zip_tmp = tempfile.NamedTemporaryFile(suffix="_stems_simple.zip", delete=False)
+            with zipfile.ZipFile(zip_tmp.name, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                zf.write(v_path, arcname=os.path.basename(v_path))
+                zf.write(i_path, arcname=os.path.basename(i_path))
+            return zip_tmp.name, "Stems ZIP (Simple) erstellt"
+    except Exception as e:
+        return None, f"Simple-Splitter Fehler: {e}"
+
+
+def ui_split_stems(file, demucs_model, demucs_device, splitter_engine):
     if not file:
         return None, "Bitte zuerst eine Datei hochladen."
-    zip_path, msg = separate_stems_demucs(file)
+    if splitter_engine == "Demucs (best)":
+        zip_path, msg = separate_stems_demucs(file, model=demucs_model, device=demucs_device)
+    else:
+        zip_path, msg = _simple_splitter_zip(file)
+    if not zip_path or not os.path.isfile(zip_path):
+        zip_path = None
     return zip_path, msg
 
 # ----------------------
@@ -447,20 +516,23 @@ def ui_process(file, preset_name, denoise_strength, deesser_threshold_db, deesse
         target_lufs,
     )
 
-    mp3_path, used_preset = process_pipeline(
-        file,
-        preset_name,
-        denoise_strength,
-        deesser_threshold_db,
-        deesser_ratio,
-        comp_threshold_db,
-        comp_ratio,
-        saturation_drive,
-        target_lufs,
-        dereverb_strength,
-        output_format,
-    )
-    return mp3_path, f"Preset: {used_preset}"
+    try:
+        out_path, used_preset = process_pipeline(
+            file,
+            preset_name,
+            denoise_strength,
+            deesser_threshold_db,
+            deesser_ratio,
+            comp_threshold_db,
+            comp_ratio,
+            saturation_drive,
+            target_lufs,
+            dereverb_strength,
+            output_format,
+        )
+        return out_path, f"Preset: {used_preset}"
+    except Exception as e:
+        return None, f"Verarbeitung fehlgeschlagen: {e}"
 
 
 with gr.Blocks(title="AI Music Improver") as demo:
@@ -497,6 +569,11 @@ with gr.Blocks(title="AI Music Improver") as demo:
         split_btn = gr.Button("Stems aufteilen (Demucs, optional)")
         stems_zip = gr.File(label="Stems ZIP", interactive=False)
 
+    with gr.Accordion("Stems Optionen", open=False):
+        splitter_engine = gr.Dropdown(choices=["Demucs (best)", "Simple (offline)"], value="Simple (offline)", label="Engine")
+        demucs_model = gr.Dropdown(choices=["htdemucs"], value="htdemucs", label="Demucs Model")
+        demucs_device = gr.Dropdown(choices=["auto", "cpu", "mps", "cuda"], value="cpu", label="Gerät")
+
     run_btn.click(
         fn=ui_process,
         inputs=[
@@ -523,7 +600,7 @@ with gr.Blocks(title="AI Music Improver") as demo:
 
     split_btn.click(
         fn=ui_split_stems,
-        inputs=[input_audio],
+        inputs=[input_audio, demucs_model, demucs_device, splitter_engine],
         outputs=[stems_zip, status],
     )
 
