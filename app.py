@@ -528,6 +528,15 @@ with gr.Blocks(title="AI Music Improver") as demo:
     )
 
 if __name__ == "__main__":
-    demo.launch(server_port=8550)
+    # Prefer env var if provided, else try a default; fall back to auto if busy
+    port_env = os.environ.get("GRADIO_SERVER_PORT") or os.environ.get("PORT")
+    try:
+        if port_env:
+            demo.launch(server_port=int(port_env))
+        else:
+            demo.launch(server_port=8550)
+    except OSError:
+        # Let Gradio auto-select a free port
+        demo.launch(server_port=None)
 
 
