@@ -104,7 +104,8 @@ def de_esser(signal: np.ndarray, sample_rate: int, s_band: Tuple[float, float] =
 def reduce_noise(signal: np.ndarray, sample_rate: int, strength: float = 0.6) -> np.ndarray:
     # strength in [0, 1], map to prop_decrease ~ [0.2, 1.0]
     prop = 0.2 + 0.8 * np.clip(strength, 0.0, 1.0)
-    return nr.reduce_noise(y=signal, sr=sample_rate, prop_decrease=prop, stationary=False, use_tensorflow=False)
+    # noisereduce>=3 removed use_tensorflow arg
+    return nr.reduce_noise(y=signal, sr=sample_rate, prop_decrease=prop, stationary=False)
 
 
 def lufs_normalize(signal: np.ndarray, sample_rate: int, target_lufs: float = -14.0) -> np.ndarray:
@@ -527,6 +528,6 @@ with gr.Blocks(title="AI Music Improver") as demo:
     )
 
 if __name__ == "__main__":
-    demo.launch()
+    demo.launch(server_port=8550)
 
 
