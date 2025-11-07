@@ -149,9 +149,11 @@ def _has_demucs() -> bool:
     return importlib.util.find_spec("demucs") is not None
 
 
-def separate_stems_demucs(input_path: str, model: str = "htdemucs") -> Tuple[str, str]:
+def separate_stems_demucs(input_path: str, model: str = "htdemucs", device: str = "cpu") -> Tuple[str | None, str]:
     if not _has_demucs():
-        return "", "Demucs nicht installiert. Optional mit: pip install demucs torch torchaudio"
+        return None, "Demucs nicht installiert. Optional mit: pip install demucs torch torchaudio"
+    if not input_path or not os.path.isfile(input_path):
+        return None, f"Ungültiger Datei-Pfad: {input_path}"
     out_root = tempfile.mkdtemp(prefix="demucs_out_")
     try:
         cmd = [
@@ -162,11 +164,34 @@ def separate_stems_demucs(input_path: str, model: str = "htdemucs") -> Tuple[str
             model,
             "-o",
             out_root,
-            input_path,
+            "--jobs",
+            "1",
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if device and device.lower() != "auto":
+            cmd += ["-d", device.lower()]
+        cmd += [input_path]
+
+        env = os.environ.copy()
+        # ensure writable local caches for model downloads
+        cache_root = os.path.join(os.path.dirname(__file__), ".cache")
+        os.makedirs(cache_root, exist_ok=True)
+        env.setdefault("XDG_CACHE_HOME", cache_root)
+        env.setdefault("TORCH_HOME", os.path.join(cache_root, "torch"))
+        env.setdefault("DEMUCS_HOME", os.path.join(cache_root, "demucs"))
+        env.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
+        proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
         if proc.returncode != 0:
-            return "", f"Demucs Fehler: {proc.stderr or proc.stdout}"
+            err = (proc.stderr or proc.stdout or "").strip()
+            # Kürzen langer Ausgaben
+            if len(err) > 2000:
+                err = err[:2000] + "..."
+            shown_cmd = " ".join(cmd[:8]) + " ..." if len(" ".join(cmd)) > 120 else " ".join(cmd)
+            return None, (
+                f"Demucs Fehler (Code {proc.returncode}) auf Gerät '{device}':\n"
+                f"{err}\nCommand: {shown_cmd}\n"
+                "Hinweis: Stelle Internetzugang sicher (Modell-Download), und versuche Gerät 'cpu'."
+            )
 
         stems_dir = None
         for root, dirs, files in os.walk(out_root):
@@ -174,7 +199,7 @@ def separate_stems_demucs(input_path: str, model: str = "htdemucs") -> Tuple[str
             if wavs:
                 stems_dir = root
         if stems_dir is None:
-            return "", "Keine Stems gefunden."
+            return None, "Keine Stems gefunden."
 
         zip_tmp = tempfile.NamedTemporaryFile(suffix="_stems.zip", delete=False)
         with zipfile.ZipFile(zip_tmp.name, "w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -183,14 +208,125 @@ def separate_stems_demucs(input_path: str, model: str = "htdemucs") -> Tuple[str
                     zf.write(os.path.join(stems_dir, f), arcname=f)
         return zip_tmp.name, "Stems ZIP erstellt"
     except Exception as e:
-        return "", f"Demucs Ausnahme: {e}"
+        return None, f"Demucs Ausnahme: {e}"
 
 
-def ui_split_stems(file):
-    if not file:
-        return None, "Bitte zuerst eine Datei hochladen."
-    zip_path, msg = separate_stems_demucs(file)
-    return zip_path, msg
+def prewarm_demucs(model: str = "htdemucs", device: str = "cpu") -> str:
+    if not _has_demucs():
+        return "Demucs nicht installiert. Optional mit: pip install demucs torch torchaudio"
+    # Gemeinsame Cache-Umgebung setzen
+    cache_root = os.path.join(os.path.dirname(__file__), ".cache")
+    os.makedirs(cache_root, exist_ok=True)
+    os.environ.setdefault("XDG_CACHE_HOME", cache_root)
+    os.environ.setdefault("HF_HOME", os.path.join(cache_root, "hf"))
+    os.environ.setdefault("TORCH_HOME", os.path.join(cache_root, "torch"))
+    os.environ.setdefault("DEMUCS_HOME", os.path.join(cache_root, "demucs"))
+    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+    # 1) Versuche Python-API (schnelleres Feedback, klarere Fehler)
+    try:
+        try:
+            import demucs.pretrained as demucs_pretrained  # type: ignore
+            _ = demucs_pretrained.get_model(model)
+            return "Demucs Modell vorgeladen (API)."
+        except Exception as api_err:
+            api_msg = str(api_err)
+            # 2) Fallback: CLI-Trigger mit kurzer Stille-Datei
+            with tempfile.TemporaryDirectory() as td:
+                sr = 48000
+                silence = np.zeros((sr // 2,), dtype=np.float32)
+                test_wav = os.path.join(td, "silence.wav")
+                sf.write(test_wav, silence, sr)
+
+                cmd = [
+                    sys.executable,
+                    "-m",
+                    "demucs.separate",
+                    "-n",
+                    model,
+                    "-o",
+                    td,
+                    "--jobs",
+                    "1",
+                ]
+                if device and device.lower() != "auto":
+                    cmd += ["-d", device.lower()]
+                cmd += [test_wav]
+
+                env = os.environ.copy()
+                proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
+                if proc.returncode != 0:
+                    err = (proc.stderr or proc.stdout or "").strip()
+                    if len(err) > 2000:
+                        err = err[:2000] + "..."
+                    return (
+                        "Prewarm fehlgeschlagen. Details:\n"
+                        f"API: {api_msg[:600]}\nCLI: {err}"
+                    )
+            return "Demucs Modell vorgeladen (CLI)."
+    except Exception as e:
+        return f"Prewarm Ausnahme: {e}"
+
+
+def _simple_splitter_zip(input_path: str, strength: float) -> Tuple[str | None, str]:
+    try:
+        y, sr = librosa.load(input_path, sr=48000, mono=False)
+        y = _ensure_2d(y)
+        if y.shape[0] == 1:
+            y = np.vstack([y[0], y[0]])
+
+        left, right = y[0], y[1]
+        mid = 0.5 * (left + right)
+        side = 0.5 * (left - right)
+
+        n_fft = 4096
+        hop = 1024
+        eps = 1e-8
+
+        mid_stft = librosa.stft(mid, n_fft=n_fft, hop_length=hop, window='hann')
+        side_stft = librosa.stft(side, n_fft=n_fft, hop_length=hop, window='hann')
+        S_mid = np.abs(mid_stft)
+        S_side = np.abs(side_stft)
+
+        # HPSS on mid to separate harmonic (likely vocals/instruments) vs percussive
+        H_mid, P_mid = librosa.decompose.hpss(S_mid)
+
+        # Frequency band emphasis for vocals
+        freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
+        band_mask = ((freqs >= 120.0) & (freqs <= 9000.0)).astype(np.float32)[:, None]
+
+        # Center-panned assumption (downweight strong side energy)
+        center_ratio = S_mid / (S_mid + S_side + eps)
+
+        vocal_mask = (H_mid / (H_mid + P_mid + eps)) * band_mask * (center_ratio ** 1.2)
+        # Normalize mask to [0,1]
+        vocal_mask = np.clip(vocal_mask / (np.max(vocal_mask) + eps), 0.0, 1.0)
+        # Strength shaping
+        gamma = 0.8 + 1.4 * np.clip(strength, 0.0, 1.0)
+        vocal_mask = vocal_mask ** gamma
+
+        # Reconstruct vocal mono from mid phase
+        vocal_stft = vocal_mask * mid_stft
+        vocal_mono = librosa.istft(vocal_stft, hop_length=hop, length=len(mid))
+        vocal_mono = soft_limiter(vocal_mono, ceiling_db=-0.5)
+        vocal_stereo = np.vstack([vocal_mono, vocal_mono])
+
+        instrumental = y - vocal_stereo
+        instrumental = soft_limiter(instrumental, ceiling_db=-0.5)
+
+        with tempfile.TemporaryDirectory() as td:
+            v_path = os.path.join(td, "vocals_simple.wav")
+            i_path = os.path.join(td, "instrumental_simple.wav")
+            sf.write(v_path, vocal_stereo.T, sr, subtype="PCM_16")
+            sf.write(i_path, instrumental.T, sr, subtype="PCM_16")
+
+            zip_tmp = tempfile.NamedTemporaryFile(suffix="_stems_simple.zip", delete=False)
+            with zipfile.ZipFile(zip_tmp.name, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                zf.write(v_path, arcname=os.path.basename(v_path))
+                zf.write(i_path, arcname=os.path.basename(i_path))
+            return zip_tmp.name, "Stems ZIP (Simple) erstellt"
+    except Exception as e:
+        return None, f"Simple-Splitter Fehler: {e}"
+
 
 # ----------------------
 # Presets and parameters
@@ -447,20 +583,43 @@ def ui_process(file, preset_name, denoise_strength, deesser_threshold_db, deesse
         target_lufs,
     )
 
-    mp3_path, used_preset = process_pipeline(
-        file,
-        preset_name,
-        denoise_strength,
-        deesser_threshold_db,
-        deesser_ratio,
-        comp_threshold_db,
-        comp_ratio,
-        saturation_drive,
-        target_lufs,
-        dereverb_strength,
-        output_format,
-    )
-    return mp3_path, f"Preset: {used_preset}"
+    try:
+        out_path, used_preset = process_pipeline(
+            file,
+            preset_name,
+            denoise_strength,
+            deesser_threshold_db,
+            deesser_ratio,
+            comp_threshold_db,
+            comp_ratio,
+            saturation_drive,
+            target_lufs,
+            dereverb_strength,
+            output_format,
+        )
+        return out_path, f"Preset: {used_preset}"
+    except Exception as e:
+        return None, f"Verarbeitung fehlgeschlagen: {e}"
+
+
+def ui_split_stems(file, demucs_model, demucs_device, splitter_engine, split_strength, progress=gr.Progress(track_tqdm=True)):
+    if not file:
+        return None, "Bitte zuerst eine Datei hochladen."
+    try:
+        progress(0.05, desc="Vorbereitung")
+        if splitter_engine == "Demucs (best)":
+            progress(0.15, desc="Demucs startet")
+            zip_path, msg = separate_stems_demucs(file, model=demucs_model, device=demucs_device)
+        else:
+            progress(0.2, desc="Simple STFT/HPSS")
+            zip_path, msg = _simple_splitter_zip(file, strength=split_strength)
+        progress(0.9, desc="Finalisiere ZIP")
+        if not zip_path or not os.path.isfile(zip_path):
+            return None, msg
+        progress(1.0, desc="Fertig")
+        return zip_path, msg
+    except Exception as e:
+        return None, f"Stems fehlgeschlagen: {e}"
 
 
 with gr.Blocks(title="AI Music Improver") as demo:
@@ -497,6 +656,13 @@ with gr.Blocks(title="AI Music Improver") as demo:
         split_btn = gr.Button("Stems aufteilen (Demucs, optional)")
         stems_zip = gr.File(label="Stems ZIP", interactive=False)
 
+    with gr.Accordion("Stems Optionen", open=False):
+        splitter_engine = gr.Dropdown(choices=["Demucs (best)", "Simple (offline)"], value="Simple (offline)", label="Engine")
+        demucs_model = gr.Dropdown(choices=["htdemucs"], value="htdemucs", label="Demucs Model")
+        demucs_device = gr.Dropdown(choices=["auto", "cpu", "mps", "cuda"], value="cpu", label="Gerät")
+        split_strength = gr.Slider(0.0, 1.0, value=0.7, step=0.05, label="Simple: Vocal Split Strength")
+        prewarm_btn = gr.Button("Modelle vorladen (Demucs)")
+
     run_btn.click(
         fn=ui_process,
         inputs=[
@@ -523,20 +689,30 @@ with gr.Blocks(title="AI Music Improver") as demo:
 
     split_btn.click(
         fn=ui_split_stems,
-        inputs=[input_audio],
+        inputs=[input_audio, demucs_model, demucs_device, splitter_engine, split_strength],
         outputs=[stems_zip, status],
     )
 
+    def ui_prewarm_demucs(demucs_model, demucs_device):
+        return prewarm_demucs(model=demucs_model, device=demucs_device)
+
+    prewarm_btn.click(
+        fn=ui_prewarm_demucs,
+        inputs=[demucs_model, demucs_device],
+        outputs=[status],
+    )
+
 if __name__ == "__main__":
-    # Prefer env var if provided, else try a default; fall back to auto if busy
+    # Prefer env vars; fall back to safe defaults
     port_env = os.environ.get("GRADIO_SERVER_PORT") or os.environ.get("PORT")
+    server_name_env = os.environ.get("GRADIO_SERVER_NAME") or os.environ.get("HOST")
     try:
         if port_env:
-            demo.launch(server_port=int(port_env))
+            demo.launch(server_port=int(port_env), server_name=server_name_env)
         else:
-            demo.launch(server_port=8550)
+            demo.launch(server_port=8550, server_name=server_name_env)
     except OSError:
         # Let Gradio auto-select a free port
-        demo.launch(server_port=None)
+        demo.launch(server_port=None, server_name=server_name_env)
 
 

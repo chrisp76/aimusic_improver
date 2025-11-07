@@ -10,7 +10,7 @@ Web-App zum Hochladen von MP3/WAV-Dateien und "Humanizing" der Audios mit:
 - De-Reverb (leichtgewichtige Nachhall-Reduktion)
 - Analyse & Empfehlungen (automatische Artefakt-Erkennung)
 
-Die App ist in Python (Gradio) gebaut und läuft lokal im Browser.
+Die App ist in Python (Gradio) gebaut und läuft lokal im Browser oder in Docker.
 
 ## Voraussetzungen
 
@@ -38,6 +38,29 @@ python app.py
 ```
 
 Die App startet mit einer lokalen URL (z.B. http://127.0.0.1:7860). Öffne die URL im Browser.
+
+## Docker
+
+### Build & Run (Docker direkt)
+
+```bash
+cd /Users/christianpohlmann/aimusic_improver
+docker build -t aimusic_improver .
+docker run --rm -p 8686:8686 \
+  -e GRADIO_SERVER_PORT=8686 \
+  -e GRADIO_SERVER_NAME=0.0.0.0 \
+  -v demucs_cache:/cache \
+  aimusic_improver
+```
+
+### Docker Compose
+
+```bash
+cd /Users/christianpohlmann/aimusic_improver
+docker compose up --build
+```
+
+Die App ist dann unter `http://localhost:8686` erreichbar. Der Cache (Modelle) wird persistent in `demucs_cache` gehalten.
 
 ## Nutzung
 
@@ -68,6 +91,7 @@ pip install demucs torch torchaudio
 ```
 
 Danach in der App auf "Stems aufteilen (Demucs)" klicken – ein ZIP mit WAV-Stems wird erzeugt.
+In Docker ggf. zuerst "Modelle vorladen (Demucs)" drücken (Internet im Container notwendig).
 
 ### Hinweise zu De-Reverb & Analyse
 
