@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+.cache/
+*.pyc
+*.pyo
+*.swp
+*.zip
+*.mp3
+*.wav
+build/
+dist/
+node_modules/
+
