@@ -1,0 +1,15 @@
+.venv
+__pycache__
+.cache
+.git
+.gitignore
+*.pyc
+*.pyo
+*.swp
+*.zip
+*.mp3
+*.wav
+build/
+dist/
+node_modules/
+

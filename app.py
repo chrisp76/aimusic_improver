@@ -214,44 +214,55 @@ def separate_stems_demucs(input_path: str, model: str = "htdemucs", device: str 
 def prewarm_demucs(model: str = "htdemucs", device: str = "cpu") -> str:
     if not _has_demucs():
         return "Demucs nicht installiert. Optional mit: pip install demucs torch torchaudio"
+    # Gemeinsame Cache-Umgebung setzen
+    cache_root = os.path.join(os.path.dirname(__file__), ".cache")
+    os.makedirs(cache_root, exist_ok=True)
+    os.environ.setdefault("XDG_CACHE_HOME", cache_root)
+    os.environ.setdefault("HF_HOME", os.path.join(cache_root, "hf"))
+    os.environ.setdefault("TORCH_HOME", os.path.join(cache_root, "torch"))
+    os.environ.setdefault("DEMUCS_HOME", os.path.join(cache_root, "demucs"))
+    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+    # 1) Versuche Python-API (schnelleres Feedback, klarere Fehler)
     try:
-        # Create a tiny silent wav to trigger model download
-        with tempfile.TemporaryDirectory() as td:
-            sr = 48000
-            silence = np.zeros((sr // 2,), dtype=np.float32)
-            test_wav = os.path.join(td, "silence.wav")
-            sf.write(test_wav, silence, sr)
+        try:
+            import demucs.pretrained as demucs_pretrained  # type: ignore
+            _ = demucs_pretrained.get_model(model)
+            return "Demucs Modell vorgeladen (API)."
+        except Exception as api_err:
+            api_msg = str(api_err)
+            # 2) Fallback: CLI-Trigger mit kurzer Stille-Datei
+            with tempfile.TemporaryDirectory() as td:
+                sr = 48000
+                silence = np.zeros((sr // 2,), dtype=np.float32)
+                test_wav = os.path.join(td, "silence.wav")
+                sf.write(test_wav, silence, sr)
 
-            cmd = [
-                sys.executable,
-                "-m",
-                "demucs.separate",
-                "-n",
-                model,
-                "-o",
-                td,
-                "--jobs",
-                "1",
-            ]
-            if device and device.lower() != "auto":
-                cmd += ["-d", device.lower()]
-            cmd += [test_wav]
+                cmd = [
+                    sys.executable,
+                    "-m",
+                    "demucs.separate",
+                    "-n",
+                    model,
+                    "-o",
+                    td,
+                    "--jobs",
+                    "1",
+                ]
+                if device and device.lower() != "auto":
+                    cmd += ["-d", device.lower()]
+                cmd += [test_wav]
 
-            env = os.environ.copy()
-            cache_root = os.path.join(os.path.dirname(__file__), ".cache")
-            os.makedirs(cache_root, exist_ok=True)
-            env.setdefault("XDG_CACHE_HOME", cache_root)
-            env.setdefault("TORCH_HOME", os.path.join(cache_root, "torch"))
-            env.setdefault("DEMUCS_HOME", os.path.join(cache_root, "demucs"))
-            env.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-
-            proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
-            if proc.returncode != 0:
-                err = (proc.stderr or proc.stdout or "").strip()
-                if len(err) > 2000:
-                    err = err[:2000] + "..."
-                return f"Prewarm fehlgeschlagen: {err}"
-        return "Demucs Modell vorgeladen."
+                env = os.environ.copy()
+                proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
+                if proc.returncode != 0:
+                    err = (proc.stderr or proc.stdout or "").strip()
+                    if len(err) > 2000:
+                        err = err[:2000] + "..."
+                    return (
+                        "Prewarm fehlgeschlagen. Details:\n"
+                        f"API: {api_msg[:600]}\nCLI: {err}"
+                    )
+            return "Demucs Modell vorgeladen (CLI)."
     except Exception as e:
         return f"Prewarm Ausnahme: {e}"
 
@@ -692,15 +703,16 @@ with gr.Blocks(title="AI Music Improver") as demo:
     )
 
 if __name__ == "__main__":
-    # Prefer env var if provided, else try a default; fall back to auto if busy
+    # Prefer env vars; fall back to safe defaults
     port_env = os.environ.get("GRADIO_SERVER_PORT") or os.environ.get("PORT")
+    server_name_env = os.environ.get("GRADIO_SERVER_NAME") or os.environ.get("HOST")
     try:
         if port_env:
-            demo.launch(server_port=int(port_env))
+            demo.launch(server_port=int(port_env), server_name=server_name_env)
         else:
-            demo.launch(server_port=8550)
+            demo.launch(server_port=8550, server_name=server_name_env)
     except OSError:
         # Let Gradio auto-select a free port
-        demo.launch(server_port=None)
+        demo.launch(server_port=None, server_name=server_name_env)
 
 
